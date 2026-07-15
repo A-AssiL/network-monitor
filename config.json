@@ -1,0 +1,8 @@
+
+{
+  "refresh_interval": 1.0,
+  "interface": null,
+  "theme": "dark",
+  "database_path": "network_monitor.db",
+  "log_level": "INFO"
+}
