@@ -1,174 +1,216 @@
-"""
-Main application window.
+"""Application main window.
 ​
-The top-level shell of Network Monitor Pro. It composes the persistent chrome
-around the swappable page content:
+The :class:`MainWindow` is the integration hub of Network Monitor Pro. It owns
+the navigation shell (sidebar + toolbar + status bar), the feature pages, and
+the background **services** that feed them:
 ​
-- **Left sidebar** navigation: Dashboard, Devices, Traffic, History, Settings.
-- **Top toolbar**: global actions (Scan, and a theme toggle placeholder).
-- **Main content area**: a :class:`QStackedWidget` that shows one page at a
-  time, switched by the sidebar.
-- **Status bar**: transient status messages.
+- :class:`~app.services.monitor_service.MonitorService` -- live bandwidth samples.
+- :class:`~app.services.scan_service.ScanService`       -- ARP scans + device persistence.
+- :class:`~app.services.persistence_service.PersistenceService` -- traffic write-through and history read-back.
 ​
-The window applies the application-wide **dark theme** stylesheet and wires
-the navigation to the individual page widgets. Pages that are not yet
-implemented (e.g. History in Phase 1) fall back to a simple placeholder so the
-navigation is always complete and the app always launches.
-​
-Architecture
-------------
-- The window owns the page instances but contains no network/database logic.
-- Background workers created by the pages (e.g. the Devices scan worker) keep
-  the GUI responsive; the window merely relays high-level actions such as the
-  toolbar Scan button to the relevant page.
+The window is created with an optional ``database`` (opened by ``main.py``). All
+services and the persistence layer are optional: if a dependency is missing the
+window still runs, it simply skips the corresponding wiring. Signals flow
+strictly one way -- services emit domain objects, the window fans them out to
+the relevant pages, and the pages remain pure views.
 """
 
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
+from typing import Any
 
 from PySide6.QtCore import Qt, Slot
-from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QButtonGroup,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QPushButton,
-    QSizePolicy,
     QStackedWidget,
+    QStatusBar,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
-from app import __app_name__, __version__
 from app.ui.dashboard import DashboardPage
 from app.ui.devices_page import DevicesPage
 from app.ui.graphs_page import GraphsPage
 
-# Settings page is optional at this stage; fall back gracefully if absent.
+# Optional pages / services -- soft-imported so a missing module never blocks
+# application startup.
 try:
     from app.ui.settings_page import SettingsPage
-except Exception:  # not yet implemented
-    SettingsPage = None  # type: ignore[assignment,misc]
+except Exception:  # pragma: no cover
+    SettingsPage = None  # type: ignore[assignment]
+
+try:
+    from app.ui.history_page import HistoryPage
+except Exception:  # pragma: no cover
+    HistoryPage = None  # type: ignore[assignment]
+
+try:
+    from services.monitor_service import MonitorService
+except Exception:  # pragma: no cover
+    MonitorService = None  # type: ignore[assignment]
+
+try:
+    from services.scan_service import ScanService
+except Exception:  # pragma: no cover
+    ScanService = None  # type: ignore[assignment]
+
+try:
+    from services.persistence_service import PersistenceService
+except Exception:  # pragma: no cover
+    PersistenceService = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
-SIDEBAR_WIDTH = 200
+# Sidebar navigation entries, in order.
+_NAV_ITEMS: tuple[str, ...] = ("Dashboard", "Devices", "Traffic", "History", "Settings")
 
-# Navigation entries: (label, icon-emoji). Order defines sidebar + stack order.
-_NAV_ITEMS: list[tuple[str, str]] = [
-    ("Dashboard", "\U0001F4CA"),
-    ("Devices", "\U0001F5A5"),
-    ("Traffic", "\U0001F4C8"),
-    ("History", "\U0001F553"),
-    ("Settings", "\u2699"),
-]
-
-# Application-wide dark theme stylesheet.
 _DARK_QSS = """
-QMainWindow, QWidget { background-color: #16171d; color: #e6edf3;
-    font-family: 'Segoe UI', 'Noto Sans', sans-serif; font-size: 13px; }
-QToolBar { background-color: #1b1c22; border: none; border-bottom: 1px solid #2c2e38;
-    padding: 6px 10px; spacing: 8px; }
-QToolBar QToolButton, QToolBar QPushButton { color: #e6edf3; background: #22242c;
-    border: 1px solid #2c2e38; border-radius: 6px; padding: 6px 12px; }
-QToolBar QToolButton:hover, QToolBar QPushButton:hover { background: #2c2f3a; }
-QStatusBar { background-color: #1b1c22; color: #8b949e;
-    border-top: 1px solid #2c2e38; }
-QLineEdit, QComboBox { background: #1e1f26; border: 1px solid #2c2e38;
-    border-radius: 6px; padding: 6px 8px; color: #e6edf3; }
-QLineEdit:focus, QComboBox:focus { border: 1px solid #4ea1ff; }
-QPushButton { background: #238636; color: white; border: none; border-radius: 6px;
-    padding: 8px 16px; font-weight: 600; }
-QPushButton:hover { background: #2ea043; }
-QPushButton:disabled { background: #30363d; color: #8b949e; }
-QTableWidget { background: #1e1f26; alternate-background-color: #1a1b22;
-    gridline-color: #2c2e38; border: 1px solid #2c2e38; border-radius: 8px;
-    selection-background-color: #1f6feb; selection-color: white; }
-QHeaderView::section { background: #22242c; color: #8b949e; padding: 8px;
-    border: none; border-bottom: 1px solid #2c2e38; font-weight: 600; }
-QScrollBar:vertical { background: #16171d; width: 10px; margin: 0; }
-QScrollBar::handle:vertical { background: #2c2e38; border-radius: 5px; min-height: 24px; }
-QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
-"""
-
-# Sidebar-specific styling (applied to the sidebar container only).
-_SIDEBAR_QSS = """
-QWidget#sidebar { background-color: #101116; border-right: 1px solid #2c2e38; }
-QPushButton#navButton { background: transparent; color: #8b949e; border: none;
-    border-radius: 8px; padding: 10px 14px; text-align: left; font-size: 14px;
-    font-weight: 500; }
-QPushButton#navButton:hover { background: #1b1c22; color: #e6edf3; }
-QPushButton#navButton:checked { background: #1f6feb22; color: #4ea1ff;
-    font-weight: 700; }
+QMainWindow, QWidget { background-color: #16171d; color: #e6edf3; }
+QToolBar {
+    background-color: #1b1c22;
+    border-bottom: 1px solid #2c2e38;
+    spacing: 8px;
+    padding: 6px;
+}
+QStatusBar { background-color: #1b1c22; color: #8b949e; }
+QListWidget#navSidebar {
+    background-color: #1b1c22;
+    border: none;
+    border-right: 1px solid #2c2e38;
+    outline: 0;
+    padding-top: 8px;
+}
+QListWidget#navSidebar::item {
+    padding: 12px 20px;
+    color: #b6bec9;
+    border: none;
+}
+QListWidget#navSidebar::item:selected {
+    background-color: #262832;
+    color: #ffffff;
+    border-left: 3px solid #4ea1ff;
+}
+QListWidget#navSidebar::item:hover { background-color: #21232c; }
+QPushButton {
+    background-color: #262832;
+    border: 1px solid #333644;
+    border-radius: 6px;
+    padding: 6px 14px;
+    color: #e6edf3;
+}
+QPushButton:hover { background-color: #30333f; }
+QPushButton:pressed { background-color: #3a3e4c; }
 """
 
 
 class _PlaceholderPage(QWidget):
-    """Simple placeholder shown for pages not yet implemented."""
+    """Simple centered-label placeholder for pages not yet available."""
 
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        heading = QLabel(title)
-        heading.setStyleSheet("font-size: 22px; font-weight: 700; color: #e6edf3;")
-        note = QLabel("Coming soon.")
-        note.setStyleSheet("color: #8b949e;")
-        layout.addWidget(heading)
-        layout.addWidget(note)
-        layout.addStretch(1)
+        label = QLabel(f"{title}\n(coming soon)")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("color: #8b949e; font-size: 16px;")
+        layout.addWidget(label)
 
 
 class MainWindow(QMainWindow):
-    """
-    The application's main window: sidebar + toolbar + content + status bar.
+    """Top-level window: navigation shell, feature pages, and services."""
 
-    Parameters
-    ----------
-    config:
-        Optional application configuration object/dict. Passed through to the
-        Settings page when available; unused otherwise.
-    """
-
-    def __init__(self, config: object | None = None, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+        database: Any | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
-        self._config = config
+        self._config = config or {}
+        self._database = database
 
-        self.setWindowTitle(f"{__app_name__}")
+        # Services (created in _start_services once the UI exists).
+        self._monitor = None
+        self._scan_service = None
+        self._persistence = None
+
+        self.setWindowTitle("Network Monitor Pro")
         self.resize(1180, 720)
         self.setStyleSheet(_DARK_QSS)
 
-        self._stack = QStackedWidget()
-        self._nav_group = QButtonGroup(self)
-        self._nav_group.setExclusive(True)
-        self._pages: dict[str, QWidget] = {}
+        self._build_ui()
+        self._start_services()
 
-        self._build_pages()
-        self._build_layout()
+    # -- UI construction -------------------------------------------------
+    def _build_ui(self) -> None:
+        """Assemble the toolbar, sidebar, stacked pages, and status bar."""
         self._build_toolbar()
-        self._build_status_bar()
 
-        # Start on the Dashboard.
-        self._select_index(0)
+        central = QWidget(self)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-    # -- construction ----------------------------------------------------
+        # Sidebar.
+        self._sidebar = QListWidget()
+        self._sidebar.setObjectName("navSidebar")
+        self._sidebar.setFixedWidth(200)
+        for name in _NAV_ITEMS:
+            self._sidebar.addItem(QListWidgetItem(name))
+        self._sidebar.currentRowChanged.connect(self._on_nav_changed)
+        root.addWidget(self._sidebar)
+
+        # Pages.
+        self._stack = QStackedWidget()
+        self._build_pages()
+        root.addWidget(self._stack, 1)
+
+        self.setCentralWidget(central)
+
+        # Status bar.
+        self.setStatusBar(QStatusBar())
+        self.statusBar().showMessage("Ready")
+
+        self._sidebar.setCurrentRow(0)
+
+    def _build_toolbar(self) -> None:
+        """Create the top toolbar with the global Scan action."""
+        toolbar = QToolBar("Main")
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
+
+        title = QLabel("  Network Monitor Pro  ")
+        title.setStyleSheet("font-size: 15px; font-weight: 700; color: #ffffff;")
+        toolbar.addWidget(title)
+
+        spacer = QWidget()
+        spacer.setSizePolicy(spacer.sizePolicy().horizontalPolicy(), spacer.sizePolicy().verticalPolicy())
+        toolbar.addWidget(spacer)
+
+        self._scan_button = QPushButton("Scan Network")
+        self._scan_button.clicked.connect(self._on_scan_clicked)
+        toolbar.addWidget(self._scan_button)
 
     def _build_pages(self) -> None:
-        """Instantiate the page widgets (with placeholders where needed)."""
+        """Instantiate the feature pages and register them in the stack."""
         self.dashboard_page = DashboardPage()
         self.devices_page = DevicesPage()
         self.graphs_page = GraphsPage()
-        self.history_page = _PlaceholderPage("History")
+
+        if HistoryPage is not None:
+            self.history_page: QWidget = HistoryPage()
+        else:
+            self.history_page = _PlaceholderPage("History")
 
         if SettingsPage is not None:
-            try:
-                self.settings_page: QWidget = SettingsPage(self._config)
-            except Exception as exc:  # constructor signature mismatch, etc.
-                logger.warning("Could not build SettingsPage: %s", exc)
-                self.settings_page = _PlaceholderPage("Settings")
+            self.settings_page: QWidget = SettingsPage(config=self._config)
         else:
             self.settings_page = _PlaceholderPage("Settings")
 
@@ -180,119 +222,272 @@ class MainWindow(QMainWindow):
             "History": self.history_page,
             "Settings": self.settings_page,
         }
-        for label, _icon in _NAV_ITEMS:
-            self._stack.addWidget(self._pages[label])
+        for name in _NAV_ITEMS:
+            self._stack.addWidget(self._pages[name])
 
-    def _build_layout(self) -> None:
-        """Compose the sidebar and content area into the central widget."""
-        central = QWidget()
-        root = QHBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
+    # -- services / wiring ----------------------------------------------
+    def _start_services(self) -> None:
+        """Create the background services and connect their signals to pages."""
+        self._start_persistence()
+        self._start_scan_service()
+        self._start_monitor()
+        self._wire_settings()
+        self._wire_history()
 
-        root.addWidget(self._build_sidebar())
-        root.addWidget(self._stack, stretch=1)
+        # Populate the UI from any previously persisted data.
+        if self._persistence is not None:
+            self._persistence.load_all()
 
-        self.setCentralWidget(central)
+    def _start_persistence(self) -> None:
+        """Create the traffic persistence service (write-through + read-back)."""
+        if PersistenceService is None or self._database is None:
+            logger.info("Persistence service unavailable; history will not be stored")
+            return
+        try:
+            self._persistence = PersistenceService(self._database)
+            self._persistence.traffic_history_loaded.connect(self._on_traffic_loaded)
+            self._persistence.devices_loaded.connect(self._on_devices_loaded)
+            self._persistence.error.connect(self._on_service_error)
+            self._persistence.start()
+            logger.info("Persistence service started")
+        except Exception as exc:  # pragma: no cover
+            logger.error("Failed to start persistence service: %s", exc)
+            self._persistence = None
 
-    def _build_sidebar(self) -> QWidget:
-        """Build the left navigation sidebar."""
-        sidebar = QWidget()
-        sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(SIDEBAR_WIDTH)
-        sidebar.setStyleSheet(_SIDEBAR_QSS)
+    def _start_scan_service(self) -> None:
+        """Create the scan service and route the Scan action through it."""
+        if ScanService is None:
+            logger.info("Scan service unavailable; using the devices page's local scan")
+            return
+        try:
+            self._scan_service = ScanService(self._database)
+            self._scan_service.scan_started.connect(self._on_scan_started)
+            self._scan_service.device_found.connect(self._on_device_found)
+            self._scan_service.finished_scan.connect(self._on_scan_finished)
+            self._scan_service.error.connect(self._on_scan_error)
+            self._redirect_devices_scan_button()
+            logger.info("Scan service ready")
+        except Exception as exc:  # pragma: no cover
+            logger.error("Failed to create scan service: %s", exc)
+            self._scan_service = None
 
-        layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(12, 20, 12, 20)
-        layout.setSpacing(6)
+    def _redirect_devices_scan_button(self) -> None:
+        """Point the devices page's inline Scan button at the scan service.
 
-        brand = QLabel(__app_name__)
-        brand.setStyleSheet(
-            "color: #e6edf3; font-size: 15px; font-weight: 800;"
-            " padding: 4px 8px 16px 8px;"
-        )
-        layout.addWidget(brand)
+        Keeps a single persisting scan path without editing the devices page.
+        All accesses are guarded so an API change there can't break startup.
+        """
+        button = getattr(self.devices_page, "_refresh_button", None)
+        if button is None:
+            return
+        try:
+            button.clicked.disconnect()
+        except Exception:
+            pass
+        try:
+            button.clicked.connect(self._start_scan)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("Could not redirect devices scan button: %s", exc)
 
-        for index, (label, icon) in enumerate(_NAV_ITEMS):
-            button = QPushButton(f"  {icon}   {label}")
-            button.setObjectName("navButton")
-            button.setCheckable(True)
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.clicked.connect(lambda _checked, i=index: self._select_index(i))
-            self._nav_group.addButton(button, index)
-            layout.addWidget(button)
+    def _start_monitor(self) -> None:
+        """Start the live bandwidth monitor and fan samples out to consumers."""
+        if MonitorService is None:
+            logger.info("Monitor service unavailable; live bandwidth disabled")
+            return
+        try:
+            interval = float(self._config_get("refresh_interval", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            interval = 1.0
+        interface = self._config_get("interface", None)
+        try:
+            self._monitor = MonitorService(interval=interval, interface=interface)
+            self._monitor.sample_ready.connect(self._on_bandwidth_sample)
+            self._monitor.error.connect(self._on_service_error)
+            if self._persistence is not None:
+                # Persist every sample (batched on the persistence thread).
+                self._monitor.sample_ready.connect(self._persistence.record_sample)
+            self._monitor.start()
+            logger.info("Bandwidth monitor started (interval=%ss)", interval)
+        except Exception as exc:  # pragma: no cover
+            logger.error("Failed to start bandwidth monitor: %s", exc)
+            self._monitor = None
 
-        layout.addStretch(1)
+    def _wire_settings(self) -> None:
+        """React to live settings changes (interface / interval)."""
+        page = self.settings_page
+        if hasattr(page, "settings_changed"):
+            try:
+                page.settings_changed.connect(self._on_settings_changed)
+            except Exception as exc:  # pragma: no cover
+                logger.debug("Could not wire settings_changed: %s", exc)
 
-        version = QLabel(f"v{__version__}")
-        version.setStyleSheet("color: #565b66; padding: 4px 8px;")
-        layout.addWidget(version)
+    def _wire_history(self) -> None:
+        """Wire the History page's refresh request to a reload from the DB."""
+        page = self.history_page
+        if hasattr(page, "refresh_requested"):
+            try:
+                page.refresh_requested.connect(self._on_history_refresh)
+            except Exception as exc:  # pragma: no cover
+                logger.debug("Could not wire history refresh: %s", exc)
 
-        return sidebar
+    # -- helpers ---------------------------------------------------------
+    def _config_get(self, key: str, default: Any = None) -> Any:
+        """Safe config accessor."""
+        try:
+            return self._config.get(key, default)
+        except AttributeError:
+            return default
 
-    def _build_toolbar(self) -> None:
-        """Build the top toolbar with global actions."""
-        toolbar = QToolBar("Main")
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
+    @staticmethod
+    def _as_objects(rows: Any) -> list[Any]:
+        """Wrap dict rows from the DB as attribute-accessible objects.
 
-        self._page_title = QLabel("Dashboard")
-        self._page_title.setStyleSheet(
-            "font-size: 15px; font-weight: 700; color: #e6edf3; padding-left: 4px;"
-        )
-        toolbar.addWidget(self._page_title)
+        The database returns plain dicts, but the pages read domain fields via
+        ``getattr``; wrapping each row in a ``SimpleNamespace`` bridges the two
+        without coupling the UI to the storage format.
+        """
+        result: list[Any] = []
+        for row in rows or []:
+            result.append(SimpleNamespace(**row) if isinstance(row, dict) else row)
+        return result
 
-        spacer = QWidget()
-        spacer.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
-        )
-        toolbar.addWidget(spacer)
-
-        self._scan_action = QAction("\U0001F50D  Scan", self)
-        self._scan_action.setToolTip("Scan the local network for devices")
-        self._scan_action.triggered.connect(self._on_scan_clicked)
-        toolbar.addAction(self._scan_action)
-
-    def _build_status_bar(self) -> None:
-        """Initialize the bottom status bar."""
-        self.statusBar().showMessage("Ready")
+    def _start_scan(self, *_args: object) -> None:
+        """Trigger a network scan via the service, falling back to the page."""
+        if self._scan_service is not None:
+            self._scan_service.start_scan()
+        elif hasattr(self.devices_page, "start_scan"):
+            self.devices_page.start_scan()
 
     # -- navigation ------------------------------------------------------
-
-    def _select_index(self, index: int) -> None:
-        """Switch to the page at *index* and sync the sidebar + toolbar."""
-        if index < 0 or index >= self._stack.count():
-            return
-        self._stack.setCurrentIndex(index)
-        label = _NAV_ITEMS[index][0]
-
-        button = self._nav_group.button(index)
-        if button is not None:
-            button.setChecked(True)
-
-        if hasattr(self, "_page_title"):
-            self._page_title.setText(label)
-        self.statusBar().showMessage(label)
-
-    # -- actions ---------------------------------------------------------
+    @Slot(int)
+    def _on_nav_changed(self, row: int) -> None:
+        if 0 <= row < self._stack.count():
+            self._stack.setCurrentIndex(row)
 
     @Slot()
     def _on_scan_clicked(self) -> None:
-        """Trigger a scan and jump to the Devices page to show progress."""
-        # Navigate to Devices (index 1) so the user sees the results populate.
-        self._select_index(1)
+        """Toolbar Scan: jump to the Devices page and start a scan."""
+        try:
+            self._sidebar.setCurrentRow(_NAV_ITEMS.index("Devices"))
+        except ValueError:
+            pass
+        self._start_scan()
+
+    # -- bandwidth -------------------------------------------------------
+    @Slot(object)
+    def _on_bandwidth_sample(self, sample: object) -> None:
+        """Fan a live bandwidth sample out to the dashboard and graphs."""
+        for page in (self.dashboard_page, self.graphs_page):
+            update = getattr(page, "update_bandwidth", None)
+            if callable(update):
+                update(sample)
+
+    # -- scanning --------------------------------------------------------
+    @Slot()
+    def _on_scan_started(self) -> None:
+        self._set_scan_busy(True)
         self.statusBar().showMessage("Scanning network\u2026")
-        self.devices_page.start_scan()
+
+    @Slot(object)
+    def _on_device_found(self, device: object) -> None:
+        upsert = getattr(self.devices_page, "upsert_device", None)
+        if callable(upsert):
+            upsert(device)
+
+    @Slot(list)
+    def _on_scan_finished(self, devices: list) -> None:
+        set_devices = getattr(self.devices_page, "set_devices", None)
+        if callable(set_devices):
+            set_devices(devices)
+        self._set_scan_busy(False)
+        online = sum(1 for d in devices if getattr(d, "online", False))
+        self._update_device_counts(online, len(devices))
+        self.statusBar().showMessage(f"Scan complete: {len(devices)} device(s) found")
+        # Reload persisted history/devices so the History tab stays current.
+        if self._persistence is not None:
+            self._persistence.load_all()
+
+    @Slot(str)
+    def _on_scan_error(self, message: str) -> None:
+        self._set_scan_busy(False)
+        self.statusBar().showMessage(f"Scan failed: {message}")
+        logger.error("Scan failed: %s", message)
+
+    def _set_scan_busy(self, busy: bool) -> None:
+        """Reflect scan progress in the toolbar button and devices page."""
+        self._scan_button.setEnabled(not busy)
+        self._scan_button.setText("Scanning\u2026" if busy else "Scan Network")
+        setter = getattr(self.devices_page, "_set_scanning", None)
+        if callable(setter):
+            try:
+                setter(busy)
+            except Exception:
+                pass
+
+    def _update_device_counts(self, connected: int, discovered: int) -> None:
+        update = getattr(self.dashboard_page, "update_device_counts", None)
+        if callable(update):
+            update(connected, discovered)
+
+    # -- persistence callbacks ------------------------------------------
+    @Slot(object)
+    def _on_traffic_loaded(self, rows: object) -> None:
+        """Feed persisted traffic history to the dashboard, graphs and history."""
+        samples = self._as_objects(rows)
+        for page in (self.dashboard_page, self.graphs_page):
+            loader = getattr(page, "load_history", None)
+            if callable(loader):
+                loader(samples)
+        setter = getattr(self.history_page, "set_traffic_history", None)
+        if callable(setter):
+            setter(samples)
+
+    @Slot(object)
+    def _on_devices_loaded(self, rows: object) -> None:
+        """Feed persisted devices to the History page and dashboard counts."""
+        devices = self._as_objects(rows)
+        setter = getattr(self.history_page, "set_devices", None)
+        if callable(setter):
+            setter(devices)
+        online = sum(1 for d in devices if getattr(d, "online", False))
+        self._update_device_counts(online, len(devices))
+
+    @Slot()
+    def _on_history_refresh(self) -> None:
+        if self._persistence is not None:
+            self._persistence.load_all()
+
+    @Slot(str)
+    def _on_service_error(self, message: str) -> None:
+        self.statusBar().showMessage(message)
+        logger.warning("Service error: %s", message)
+
+    # -- settings --------------------------------------------------------
+    @Slot(dict)
+    def _on_settings_changed(self, settings: dict) -> None:
+        """Apply interface/interval changes to the running monitor live."""
+        if not isinstance(settings, dict) or self._monitor is None:
+            return
+        if "interface" in settings:
+            setter = getattr(self._monitor, "set_interface", None)
+            if callable(setter):
+                setter(settings["interface"])
+        if "refresh_interval" in settings:
+            setter = getattr(self._monitor, "set_interval", None)
+            if callable(setter):
+                try:
+                    setter(float(settings["refresh_interval"]))
+                except (TypeError, ValueError):
+                    pass
 
     # -- lifecycle -------------------------------------------------------
-
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
-        """Ensure background workers are stopped cleanly on close."""
-        worker = getattr(self.devices_page, "_worker", None)
-        try:
-            if worker is not None and worker.isRunning():
-                worker.cancel()
-                worker.wait(2000)
-        except Exception as exc:  # never block shutdown
-            logger.debug("Error stopping scan worker on close: %s", exc)
+    def closeEvent(self, event: Any) -> None:
+        """Stop all background services cleanly before the window closes."""
+        for service in (self._monitor, self._scan_service, self._persistence):
+            stop = getattr(service, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception as exc:  # pragma: no cover
+                    logger.debug("Error stopping %s: %s", service, exc)
         super().closeEvent(event)

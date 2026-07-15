@@ -1,5 +1,4 @@
-"""
-Dashboard page.
+"""Dashboard page.
 ​
 The landing view of Network Monitor Pro. It surfaces the most important
 real-time metrics at a glance:
@@ -77,7 +76,6 @@ class MetricCard(QFrame):
     ) -> None:
         super().__init__(parent)
         self._unit = unit
-
         self.setObjectName("metricCard")
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -151,7 +149,6 @@ class DashboardPage(QWidget):
         self._build_ui()
 
     # -- construction ----------------------------------------------------
-
     def _build_ui(self) -> None:
         """Assemble the metric cards and live graph."""
         root = QVBoxLayout(self)
@@ -234,7 +231,6 @@ class DashboardPage(QWidget):
         return container
 
     # -- slots (state updates) ------------------------------------------
-
     @Slot(object)
     def update_bandwidth(self, sample) -> None:
         """
@@ -256,7 +252,6 @@ class DashboardPage(QWidget):
         self._download.append(download)
         self._upload.append(upload)
         self._sample_index += 1
-
         self._redraw_graph()
 
     @Slot(int, int)
@@ -287,7 +282,6 @@ class DashboardPage(QWidget):
         self._redraw_graph()
 
     # -- internals -------------------------------------------------------
-
     def _redraw_graph(self) -> None:
         """Push the current history buffers to the plot curves."""
         if self._download_curve is None or self._upload_curve is None:

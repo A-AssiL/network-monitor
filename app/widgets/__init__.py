@@ -1,22 +1,40 @@
-"""
-Reusable custom widgets.
+"""Background service layer for Network Monitor Pro.
 ​
-Small, self-contained UI components (status indicators, metric cards, styled
-tables, badges, etc.) that can be composed by the pages in :mod:`app.ui`.
+Services are the bridge between the GUI (main thread) and the blocking network
+and database work, which must never run on the GUI thread. Each service is a
+``QObject``/``QThread`` that does its work off the main thread and communicates
+results back via Qt signals:
 ​
-This package is intentionally empty for now: Phase 1 keeps its widgets inline
-within their pages (e.g. ``MetricCard`` in :mod:`app.ui.dashboard`). As those
-components are reused across pages, extract them here and re-export them below
-so callers can simply ``from app.widgets import MetricCard``.
+- :class:`MonitorService`     -- emits periodic live bandwidth samples.
+- :class:`ScanService`        -- runs ARP scans and persists discovered devices.
+- :class:`PersistenceService` -- batches traffic samples to the database and
+  reads history/devices back for the UI.
 ​
-Widgets in this package must remain view-only: no network or database access,
-and no import from :mod:`app.network` or :mod:`app.database`.
+Imports are kept tolerant: a service whose optional dependency is missing (for
+example PySide6 or Scapy) is simply exported as ``None`` instead of crashing
+the whole package at import time. Callers should check for ``None`` (the main
+window already does) before using a service.
 """
 
 from __future__ import annotations
 
-__all__: list[str] = []
+__all__ = [
+    "MonitorService",
+    "ScanService",
+    "PersistenceService",
+]
 
-# Phase 2+ convenience exports (uncomment as widgets are extracted here):
-# from .metric_card import MetricCard
-# from .status_badge import StatusBadge
+try:
+    from services.monitor_service import MonitorService
+except Exception:  # pragma: no cover - optional dependency may be missing
+    MonitorService = None  # type: ignore[assignment]
+
+try:
+    from services.scan_service import ScanService
+except Exception:  # pragma: no cover - optional dependency may be missing
+    ScanService = None  # type: ignore[assignment]
+
+try:
+    from services.persistence_service import PersistenceService
+except Exception:  # pragma: no cover - optional dependency may be missing
+    PersistenceService = None  # type: ignore[assignment]

@@ -1,17 +1,20 @@
-"""
-Network Monitor Pro -- application entry point.
+"""Network Monitor Pro -- application entry point.
 ​
 Responsibilities
 ----------------
 1. Configure application-wide **logging** (console + rotating file in ``logs/``).
 2. Load runtime **configuration** from ``config.json`` (falling back to sane
    defaults, and writing a default file on first run).
-3. Create the ``QApplication`` and the :class:`~app.ui.main_window.MainWindow`.
-4. Wire the Settings page so saved changes are persisted back to disk.
-5. Run the Qt event loop.
+3. Open the **SQLite database** used for persistence.
+4. Create the ``QApplication`` and the :class:`~app.ui.main_window.MainWindow`,
+   injecting the database so the window can own the background services
+   (bandwidth monitor, scanner, persistence).
+5. Wire the Settings page so saved changes are persisted back to disk.
+6. Run the Qt event loop and close the database cleanly on exit.
 ​
-This module is intentionally thin: it wires components together and owns the
-process lifecycle, while all feature logic lives in the ``app`` package.
+This module is intentionally thin: it wires top-level components together and
+owns the process lifecycle, while all feature logic lives in the ``app``
+package.
 ​
 Run with::
 ​
@@ -93,14 +96,12 @@ def load_config() -> dict[str, Any]:
         save_config(DEFAULT_CONFIG)
         logger.info("Created default config at %s", CONFIG_PATH)
         return dict(DEFAULT_CONFIG)
-
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as handle:
             loaded = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("Could not read config (%s); using defaults", exc)
         return dict(DEFAULT_CONFIG)
-
     config = dict(DEFAULT_CONFIG)
     config.update(loaded or {})
     return config
@@ -116,6 +117,23 @@ def save_config(config: dict[str, Any]) -> None:
         logger.info("Configuration saved to %s", CONFIG_PATH)
     except OSError as exc:
         logger.error("Failed to save config: %s", exc)
+
+
+def _open_database(config: dict[str, Any]):
+    """Open the SQLite database, returning the instance or ``None`` on failure."""
+    try:
+        from database.database import Database
+    except Exception as exc:
+        logger.error("Database layer unavailable (%s); running without persistence", exc)
+        return None
+    db_path = config.get("database_path") or str(BASE_DIR / "network_monitor.db")
+    try:
+        database = Database(db_path)
+        logger.info("Database opened at %s", db_path)
+        return database
+    except Exception as exc:
+        logger.error("Could not open database at %s (%s); running without persistence", db_path, exc)
+        return None
 
 
 def main() -> int:
@@ -140,11 +158,14 @@ def main() -> int:
     from app import __app_name__
     from app.ui.main_window import MainWindow
 
+    # Open the database before building the window so services can use it.
+    database = _open_database(config)
+
     app = QApplication(sys.argv)
     app.setApplicationName(__app_name__)
     app.setOrganizationName("Network Monitor Pro")
 
-    window = MainWindow(config=config)
+    window = MainWindow(config=config, database=database)
 
     # Persist settings changes back to config.json when the user saves.
     settings_page = getattr(window, "settings_page", None)
@@ -153,7 +174,20 @@ def main() -> int:
 
     window.show()
     logger.info("Main window shown; entering event loop")
-    return app.exec()
+
+    try:
+        exit_code = app.exec()
+    finally:
+        # Close the database once the UI has shut down (window.closeEvent has
+        # already stopped the background services by this point).
+        if database is not None:
+            try:
+                database.close()
+            except Exception as exc:
+                logger.debug("Error closing database: %s", exc)
+
+    logger.info("Network Monitor Pro exited with code %s", exit_code)
+    return exit_code
 
 
 def _on_settings_changed(settings: dict[str, Any]) -> None:

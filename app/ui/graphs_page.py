@@ -1,5 +1,4 @@
-"""
-Graphs / Traffic page.
+"""Graphs / Traffic page.
 ​
 A dedicated view for visualizing bandwidth over time. Where the Dashboard
 shows a single compact live chart, this page provides fuller, real-time
@@ -83,7 +82,6 @@ class GraphsPage(QWidget):
         self._build_ui()
 
     # -- construction ----------------------------------------------------
-
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 24)
@@ -95,7 +93,6 @@ class GraphsPage(QWidget):
         heading.setStyleSheet("font-size: 22px; font-weight: 700; color: #e6edf3;")
         header.addWidget(heading)
         header.addStretch(1)
-
         header.addWidget(self._make_caption("Window:"))
         self._window_combo = QComboBox()
         self._window_combo.addItems(list(_WINDOWS.keys()))
@@ -172,6 +169,7 @@ class GraphsPage(QWidget):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
+
         caption = QLabel(title)
         caption.setStyleSheet(
             "color: #e6edf3; font-size: 14px; font-weight: 600; border: none;"
@@ -187,7 +185,6 @@ class GraphsPage(QWidget):
         return label
 
     # -- slots (state updates) ------------------------------------------
-
     @Slot(object)
     def update_bandwidth(self, sample) -> None:
         """
@@ -206,7 +203,6 @@ class GraphsPage(QWidget):
         self._download.append(download)
         self._upload.append(upload)
         self._sample_index += 1
-
         self._redraw()
 
     def load_history(self, samples: Iterable) -> None:
@@ -223,7 +219,6 @@ class GraphsPage(QWidget):
         self._redraw()
 
     # -- internals -------------------------------------------------------
-
     @Slot(str)
     def _on_window_changed(self, label: str) -> None:
         """Change how many trailing samples are displayed."""
@@ -234,7 +229,6 @@ class GraphsPage(QWidget):
         """Push the trailing window of history to every curve."""
         if self._live_download_curve is None:
             return
-
         window = self._window
         times = list(self._times)[-window:]
         download = list(self._download)[-window:]

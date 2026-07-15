@@ -1,5 +1,4 @@
-"""
-SQLite persistence layer.
+"""SQLite persistence layer.
 ​
 Owns the application's database connection and all read/write access to it.
 The schema covers the four stores required by the spec:
@@ -112,11 +111,9 @@ class Database:
     def __init__(self, db_path: str | Path = "network_monitor.db") -> None:
         self._db_path = str(db_path)
         self._lock = threading.RLock()
-
         if self._db_path != ":memory:":
             Path(self._db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
             self._db_path = str(Path(self._db_path).expanduser())
-
         self._conn = sqlite3.connect(
             self._db_path,
             check_same_thread=False,
@@ -128,7 +125,6 @@ class Database:
         logger.info("Database ready at %s", self._db_path)
 
     # -- setup -----------------------------------------------------------
-
     def _configure(self) -> None:
         """Apply connection-level PRAGMAs for durability and concurrency."""
         with self._lock:
@@ -148,7 +144,6 @@ class Database:
                 self._conn.commit()
 
     # -- devices ---------------------------------------------------------
-
     def upsert_device(self, device: Any) -> None:
         """
         Insert or update a device row (keyed by MAC).
@@ -161,13 +156,11 @@ class Database:
         if not mac:
             logger.debug("Skipping device with no MAC: %r", device)
             return
-
         ip = getattr(device, "ip", None)
         hostname = getattr(device, "hostname", None)
         vendor = getattr(device, "vendor", None)
         online = 1 if getattr(device, "online", False) else 0
         now = float(getattr(device, "last_seen", None) or time.time())
-
         with self._lock:
             self._conn.execute(
                 """
@@ -214,7 +207,6 @@ class Database:
         return rows[0] if rows else None
 
     # -- discovery history ----------------------------------------------
-
     def record_discovery(self, device: Any, scanned_at: float | None = None) -> None:
         """Append a discovery-history entry for a sighted device."""
         mac = str(getattr(device, "mac", "")).lower()
@@ -259,7 +251,6 @@ class Database:
         )
 
     # -- traffic history ------------------------------------------------
-
     def record_traffic(self, sample: Any) -> None:
         """Append a bandwidth sample to the traffic history."""
         with self._lock:
@@ -303,7 +294,6 @@ class Database:
             self._conn.commit()
 
     # -- alerts ----------------------------------------------------------
-
     def add_alert(
         self,
         message: str,
@@ -339,7 +329,6 @@ class Database:
         return self._fetch_all(query)
 
     # -- lifecycle / helpers --------------------------------------------
-
     def _fetch_all(
         self, query: str, params: tuple[Any, ...] = ()
     ) -> list[dict[str, Any]]:
