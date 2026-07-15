@@ -1,14 +1,13 @@
-"""
-Devices page.
-​
+"""Devices page.
+
 Displays every device discovered on the local network in a sortable,
 searchable table and lets the user trigger a fresh ARP scan without freezing
 the GUI.
-​
+
 Columns
 -------
 Hostname | IP Address | MAC Address | Vendor | Status | Last Seen
-​
+
 Features
 --------
 - **Sorting** on any column (IP and Last Seen sort by true value, not text).
@@ -16,7 +15,7 @@ Features
 - **Refresh / Scan** button that runs the scan on a background thread
   (:class:`ScanWorker`) so the UI stays responsive.
 - **Double-click** a row to open a details dialog.
-​
+
 Threading
 ---------
 Scapy's ARP scan is blocking, so it runs inside a :class:`QThread`
@@ -29,7 +28,6 @@ from __future__ import annotations
 
 import ipaddress
 import logging
-import time
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QThread, Signal, Slot
@@ -49,6 +47,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from shiboken6 import isValid
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +58,7 @@ COL_MAC = 2
 COL_VENDOR = 3
 COL_STATUS = 4
 COL_LAST_SEEN = 5
+
 HEADERS = ["Hostname", "IP Address", "MAC Address", "Vendor", "Status", "Last Seen"]
 
 _ONLINE_COLOR = "#3fb950"
@@ -167,7 +167,7 @@ class DeviceDetailsDialog(QDialog):
 class DevicesPage(QWidget):
     """
     Table view of discovered network devices with search and rescan.
-
+​
     Signals
     -------
     device_activated(object):
@@ -194,7 +194,6 @@ class DevicesPage(QWidget):
         self._build_ui()
 
     # -- construction ----------------------------------------------------
-
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 24)
@@ -208,7 +207,7 @@ class DevicesPage(QWidget):
         toolbar = QHBoxLayout()
         toolbar.setSpacing(12)
 
-        self._search_box.setPlaceholderText("Search hostname, IP, MAC, or vendor…")
+        self._search_box.setPlaceholderText("Search hostname, IP, MAC, or vendor\u2026")
         self._search_box.setClearButtonEnabled(True)
         self._search_box.textChanged.connect(self._apply_filter)
         toolbar.addWidget(self._search_box, stretch=1)
@@ -240,13 +239,16 @@ class DevicesPage(QWidget):
         root.addWidget(self._table, stretch=1)
 
     # -- scanning --------------------------------------------------------
-
     @Slot()
     def start_scan(self, subnet: str | None = None) -> None:
         """Kick off a background ARP scan, guarding against concurrent runs."""
-        if self._worker is not None and self._worker.isRunning():
+        # A finished QThread may have had its underlying C++ object deleted
+        # while the Python reference lingers. isValid() guards against
+        # touching a dead object.
+        if self._worker is not None and isValid(self._worker) and self._worker.isRunning():
             logger.debug("Scan already in progress; ignoring request")
             return
+        self._worker = None  # clear any finished/stale worker before starting a new one
 
         self._set_scanning(True)
 
@@ -254,15 +256,22 @@ class DevicesPage(QWidget):
         self._worker.device_found.connect(self._on_device_found)
         self._worker.finished_scan.connect(self._on_scan_finished)
         self._worker.error.connect(self._on_scan_error)
-        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
+
+    def _on_worker_finished(self) -> None:
+        """Drop the reference and schedule deletion once the thread finishes."""
+        worker = self._worker
+        self._worker = None
+        if worker is not None:
+            worker.deleteLater()
 
     def _set_scanning(self, scanning: bool) -> None:
         """Toggle the busy state of the toolbar."""
         self._refresh_button.setEnabled(not scanning)
-        self._refresh_button.setText("Scanning…" if scanning else "Scan")
+        self._refresh_button.setText("Scanning\u2026" if scanning else "Scan")
         if scanning:
-            self._status_label.setText("Scanning network…")
+            self._status_label.setText("Scanning network\u2026")
 
     @Slot(object)
     def _on_device_found(self, device) -> None:
@@ -275,7 +284,7 @@ class DevicesPage(QWidget):
         self.set_devices(devices)
         self._set_scanning(False)
         self._status_label.setText(
-            f"{len(devices)} device(s) found · "
+            f"{len(devices)} device(s) found \u00b7 "
             f"last scan {datetime.now().strftime('%H:%M:%S')}"
         )
 
@@ -287,7 +296,6 @@ class DevicesPage(QWidget):
         QMessageBox.warning(self, "Scan Error", message)
 
     # -- populating the table -------------------------------------------
-
     def set_devices(self, devices) -> None:
         """Replace the entire table contents with *devices*."""
         self._devices.clear()
@@ -353,7 +361,6 @@ class DevicesPage(QWidget):
         )
 
     # -- interaction -----------------------------------------------------
-
     @Slot()
     def _apply_filter(self, text: str = "") -> None:
         """Hide rows that do not match the search term (case-insensitive)."""
