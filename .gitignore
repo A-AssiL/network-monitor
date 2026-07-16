@@ -1,2 +1,4 @@
 logs/
 network_monitor.db
+
+__pycache__/

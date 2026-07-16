@@ -25,15 +25,29 @@ Threading & safety
 - Database writes are **best-effort and API-tolerant**: results are always
   returned/emitted even if persistence is unavailable or a method is missing.
 """
-
 from __future__ import annotations
 
 import logging
 
 from PySide6.QtCore import QObject, QThread, Signal
-from shiboken6 import isValid
 
 logger = logging.getLogger(__name__)
+
+
+# shiboken6.isValid guards against touching a Qt object whose underlying C++
+# instance has already been deleted. Soft-imported so a missing shiboken6 never
+# stops this service from loading (it is soft-imported by the main window).
+try:  # pragma: no cover - depends on the runtime environment
+    from shiboken6 import isValid as _shiboken_is_valid
+
+    def qt_is_valid(obj: object) -> bool:
+        try:
+            return bool(_shiboken_is_valid(obj))
+        except Exception:
+            return True
+except Exception:  # pragma: no cover
+    def qt_is_valid(obj: object) -> bool:
+        return True
 
 
 class _ScanWorker(QThread):
@@ -145,8 +159,7 @@ class _ScanWorker(QThread):
 
 
 class ScanService(QObject):
-    """
-    Runs ARP scans on a background thread and persists the results.
+    """Runs ARP scans on a background thread and persists the results.
 
     Signals
     -------
@@ -175,38 +188,42 @@ class ScanService(QObject):
     def is_scanning(self) -> bool:
         """Whether a scan is currently running."""
         worker = self._worker
-        return worker is not None and isValid(worker) and worker.isRunning()
+        return worker is not None and qt_is_valid(worker) and worker.isRunning()
 
     # -- control ---------------------------------------------------------
     def start_scan(self, subnet: str | None = None) -> None:
         """Kick off a background scan, guarding against concurrent runs."""
         # A finished QThread may have had its C++ object deleted while the
-        # Python reference lingers; isValid() guards against touching it.
-        if self._worker is not None and isValid(self._worker) and self._worker.isRunning():
+        # Python reference lingers; qt_is_valid() guards against touching it.
+        if (
+            self._worker is not None
+            and qt_is_valid(self._worker)
+            and self._worker.isRunning()
+        ):
             logger.debug("Scan already in progress; ignoring request")
             return
 
         self._worker = None  # clear any finished/stale worker
+
         worker = _ScanWorker(database=self._database, subnet=subnet)
         worker.device_found.connect(self.device_found)
         worker.finished_scan.connect(self.finished_scan)
         worker.error.connect(self.error)
         worker.finished.connect(self._on_worker_finished)
         self._worker = worker
-
         self.scan_started.emit()
         worker.start()
 
     def cancel(self) -> None:
         """Cancel the running scan, if any."""
         worker = self._worker
-        if worker is not None and isValid(worker) and worker.isRunning():
+        if worker is not None and qt_is_valid(worker) and worker.isRunning():
             worker.cancel()
 
     def stop(self) -> None:
         """Cancel and wait for the worker to finish (for clean shutdown)."""
         worker = self._worker
-        if worker is not None and isValid(worker) and worker.isRunning():
+        if worker is not None and qt_is_valid(worker) and worker.isRunning():
             worker.cancel()
             worker.wait(3000)
 
@@ -215,5 +232,8 @@ class ScanService(QObject):
         """Drop our reference before deleting the C++ object (crash-safe)."""
         worker = self._worker
         self._worker = None
-        if worker is not None:
+        if worker is not None and qt_is_valid(worker):
             worker.deleteLater()
+
+
+__all__ = ["ScanService"]

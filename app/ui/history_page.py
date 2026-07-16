@@ -19,7 +19,6 @@ Architecture
 - Objects are read via ``getattr`` so the view stays decoupled from the exact
   ``models.py`` dataclasses (mirrors the Devices/Dashboard pages).
 """
-
 from __future__ import annotations
 
 import ipaddress
@@ -28,6 +27,7 @@ from collections.abc import Iterable
 from datetime import datetime
 
 from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -88,8 +88,7 @@ class _SortableItem(QTableWidgetItem):
 
 
 class HistoryPage(QWidget):
-    """
-    Read-only view of persisted device discovery and traffic history.
+    """Read-only view of persisted device discovery and traffic history.
 
     Signals
     -------
@@ -181,6 +180,9 @@ class HistoryPage(QWidget):
             self._append_device_row(device)
             count += 1
         table.setSortingEnabled(True)
+        # Apply the default sort (newest last-seen first); setSortIndicator
+        # alone only draws the arrow, it does not reorder rows.
+        table.sortItems(DEV_LAST_SEEN, Qt.SortOrder.DescendingOrder)
         self._update_status(devices_count=count)
 
     @Slot(object)
@@ -194,6 +196,7 @@ class HistoryPage(QWidget):
             self._append_traffic_row(record)
             count += 1
         table.setSortingEnabled(True)
+        table.sortItems(TRA_TIME, Qt.SortOrder.DescendingOrder)
         self._update_status(traffic_count=count)
 
     def _append_device_row(self, device: object) -> None:
@@ -216,7 +219,9 @@ class HistoryPage(QWidget):
 
         status_text = "Online" if online else "Offline"
         status_item = _SortableItem(status_text, 0 if online else 1)
-        status_item.setForeground(Qt.GlobalColor.green if online else Qt.GlobalColor.gray)
+        status_item.setForeground(
+            QBrush(QColor(_ONLINE_COLOR if online else _OFFLINE_COLOR))
+        )
         table.setItem(row, DEV_STATUS, status_item)
 
         table.setItem(
@@ -289,3 +294,6 @@ def _format_ts(value) -> str:
         return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M:%S")
     except (ValueError, OSError, TypeError):
         return "\u2014"
+
+
+__all__ = ["HistoryPage"]

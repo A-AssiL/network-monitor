@@ -1,5 +1,4 @@
-"""
-Local bandwidth monitoring.
+"""Local bandwidth monitoring.
 ​
 Measures *this computer's* upload and download throughput by sampling the
 cumulative byte counters exposed by :mod:`psutil` and converting the delta
@@ -26,7 +25,6 @@ Typical usage
     >>> monitor.sample()          # subsequent calls report real rates
     BandwidthSample(download_mbps=12.34, upload_mbps=1.05, ...)
 """
-
 from __future__ import annotations
 
 import logging
@@ -50,8 +48,7 @@ DEFAULT_INTERVAL: float = 1.0
 
 @dataclass(frozen=True, slots=True)
 class BandwidthSample:
-    """
-    A single bandwidth reading.
+    """A single bandwidth reading.
 
     Attributes
     ----------
@@ -69,7 +66,7 @@ class BandwidthSample:
         The interface being monitored, or ``None`` for the aggregate of all
         interfaces.
     """
-    
+
     timestamp: float
     download_mbps: float
     upload_mbps: float
@@ -88,8 +85,7 @@ class _CounterReading:
 
 
 class BandwidthMonitor:
-    """
-    Samples local network throughput using :mod:`psutil`.
+    """Samples local network throughput using :mod:`psutil`.
 
     Parameters
     ----------
@@ -105,15 +101,13 @@ class BandwidthMonitor:
         self._stop_event = threading.Event()
 
     # -- configuration ---------------------------------------------------
-
     @property
     def interface(self) -> str | None:
         """The interface currently being monitored (``None`` = aggregate)."""
         return self._interface
 
     def set_interface(self, interface: str | None) -> None:
-        """
-        Switch the monitored interface.
+        """Switch the monitored interface.
 
         Resets the internal baseline so the next :meth:`sample` re-primes the
         counters instead of reporting a bogus spike from mismatched readings.
@@ -133,15 +127,12 @@ class BandwidthMonitor:
             return []
 
     # -- reading counters ------------------------------------------------
-
     def _read_counters(self) -> _CounterReading | None:
-        """
-        Read the current cumulative byte counters for the target interface.
+        """Read the current cumulative byte counters for the target interface.
 
         Returns ``None`` if the configured interface is unavailable.
         """
         now = time.time()
-
         if self._interface is None:
             counters = psutil.net_io_counters(pernic=False)
             if counters is None:
@@ -160,15 +151,13 @@ class BandwidthMonitor:
         return _CounterReading(now, counters.bytes_recv, counters.bytes_sent)
 
     # -- sampling --------------------------------------------------------
-
     def reset(self) -> None:
         """Discard the baseline so the next sample re-primes the counters."""
         with self._lock:
             self._previous = None
 
     def sample(self) -> BandwidthSample | None:
-        """
-        Take a bandwidth sample.
+        """Take a bandwidth sample.
 
         The first call after construction/reset primes the counters and
         reports ``0.0`` rates. Each subsequent call computes throughput from
@@ -184,7 +173,6 @@ class BandwidthMonitor:
             current = self._read_counters()
             if current is None:
                 return None
-
             previous = self._previous
             self._previous = current
 
@@ -210,7 +198,6 @@ class BandwidthMonitor:
         upload_mbps = self._to_mbps(
             current.bytes_sent - previous.bytes_sent, elapsed
         )
-
         return BandwidthSample(
             timestamp=current.timestamp,
             download_mbps=download_mbps,
@@ -222,8 +209,7 @@ class BandwidthMonitor:
 
     @staticmethod
     def _to_mbps(delta_bytes: int, elapsed_seconds: float) -> float:
-        """
-        Convert a byte delta over an interval into megabits per second.
+        """Convert a byte delta over an interval into megabits per second.
 
         Negative deltas (counter reset/wrap, e.g. after sleep or interface
         restart) are clamped to ``0.0`` rather than reported as huge spikes.
@@ -234,14 +220,12 @@ class BandwidthMonitor:
         return round(bits / elapsed_seconds / _BITS_PER_MEGABIT, 2)
 
     # -- continuous streaming (for background workers) -------------------
-
     def stream(
         self,
         interval: float = DEFAULT_INTERVAL,
         on_sample: Callable[[BandwidthSample], None] | None = None,
     ) -> Iterator[BandwidthSample]:
-        """
-        Continuously yield samples every *interval* seconds until stopped.
+        """Continuously yield samples every *interval* seconds until stopped.
 
         Intended to run inside a background worker (QThread/asyncio). Call
         :meth:`stop` from another thread to end the loop cleanly.
@@ -265,27 +249,21 @@ class BandwidthMonitor:
             self._interface or "<all>",
             interval,
         )
-
         # Prime the counters so the first *yielded* sample is a real rate.
         self.sample()
-
         while not self._stop_event.is_set():
             # Wait returns True if stopped during the interval -> exit promptly.
             if self._stop_event.wait(timeout=interval):
                 break
-
             sample = self.sample()
             if sample is None:
                 continue
-
             if on_sample is not None:
                 try:
                     on_sample(sample)
                 except Exception as exc:  # never let a callback kill the loop
                     logger.exception("on_sample callback raised: %s", exc)
-
             yield sample
-
         logger.info("Bandwidth stream stopped")
 
     def stop(self) -> None:

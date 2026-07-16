@@ -23,7 +23,6 @@ Run with::
 Note: ARP scanning needs elevated privileges (Administrator on Windows with
 Npcap installed, or root on Linux).
 """
-
 from __future__ import annotations
 
 import json
@@ -51,8 +50,7 @@ logger = logging.getLogger("network_monitor")
 
 
 def setup_logging(log_level: str = "INFO") -> None:
-    """
-    Configure root logging with a console handler and a rotating file handler.
+    """Configure root logging with a console handler and a rotating file handler.
 
     Logs are written to ``logs/network_monitor.log`` (rotated at 1 MB, keeping
     five backups) so errors, warnings, scans, and device discovery are all
@@ -86,8 +84,7 @@ def setup_logging(log_level: str = "INFO") -> None:
 
 
 def load_config() -> dict[str, Any]:
-    """
-    Load configuration from ``config.json``.
+    """Load configuration from ``config.json``.
 
     Missing files are created with :data:`DEFAULT_CONFIG`; missing individual
     keys are backfilled from the defaults so upgrades never crash on new keys.
@@ -96,12 +93,14 @@ def load_config() -> dict[str, Any]:
         save_config(DEFAULT_CONFIG)
         logger.info("Created default config at %s", CONFIG_PATH)
         return dict(DEFAULT_CONFIG)
+
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as handle:
             loaded = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("Could not read config (%s); using defaults", exc)
         return dict(DEFAULT_CONFIG)
+
     config = dict(DEFAULT_CONFIG)
     config.update(loaded or {})
     return config
@@ -121,18 +120,31 @@ def save_config(config: dict[str, Any]) -> None:
 
 def _open_database(config: dict[str, Any]):
     """Open the SQLite database, returning the instance or ``None`` on failure."""
-    try:
-        from database.database import Database
-    except Exception as exc:
-        logger.error("Database layer unavailable (%s); running without persistence", exc)
+    # Prefer the packaged path (app.database.database); fall back to a
+    # top-level database package so the app works regardless of how it is run.
+    Database = None
+    for module_path in ("app.database.database", "database.database"):
+        try:
+            module = __import__(module_path, fromlist=["Database"])
+            Database = module.Database
+            break
+        except Exception as exc:
+            logger.debug("Could not import %s: %s", module_path, exc)
+    if Database is None:
+        logger.error("Database layer unavailable; running without persistence")
         return None
+
     db_path = config.get("database_path") or str(BASE_DIR / "network_monitor.db")
     try:
         database = Database(db_path)
         logger.info("Database opened at %s", db_path)
         return database
     except Exception as exc:
-        logger.error("Could not open database at %s (%s); running without persistence", db_path, exc)
+        logger.error(
+            "Could not open database at %s (%s); running without persistence",
+            db_path,
+            exc,
+        )
         return None
 
 

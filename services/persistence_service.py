@@ -27,12 +27,12 @@ Built to adapt to the concrete ``database.py``: it discovers bulk vs. per-row
 write methods, tries object then keyword signatures, and reads history with
 whatever ``get_traffic_history`` / ``get_devices`` signature is available.
 """
-
 from __future__ import annotations
 
 import logging
 import queue
 import threading
+import time
 from collections import deque
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
@@ -47,8 +47,7 @@ _BULK_WRITE_NAMES = ("record_traffic_bulk", "record_traffic_many", "record_traff
 
 
 class PersistenceService(QObject):
-    """
-    Batched traffic write-through and history/device read-back.
+    """Batched traffic write-through and history/device read-back.
 
     Parameters
     ----------
@@ -153,6 +152,7 @@ class _PersistenceWorker(QThread):
         self._stop = threading.Event()
         self._bulk_writer_name: str | None = None
         self._bulk_checked = False
+        self._last_flush = time.monotonic()
 
     # -- command intake --------------------------------------------------
     def submit(self, command: tuple) -> None:
@@ -166,15 +166,20 @@ class _PersistenceWorker(QThread):
 
     # -- main loop -------------------------------------------------------
     def run(self) -> None:  # noqa: D401 - QThread entry point
+        self._last_flush = time.monotonic()
         while not self._stop.is_set():
             try:
                 command = self._queue.get(timeout=self._flush_interval)
             except queue.Empty:
-                self._flush()  # periodic auto-flush
+                self._flush()  # periodic auto-flush (idle path)
                 continue
             if command is None:  # shutdown sentinel
                 break
             self._handle(command)
+            # Also flush on schedule even under steady command load, so a busy
+            # queue can't defer writes indefinitely.
+            if time.monotonic() - self._last_flush >= self._flush_interval:
+                self._flush()
         # Final flush so no buffered samples are lost on shutdown.
         self._flush()
 
@@ -194,6 +199,8 @@ class _PersistenceWorker(QThread):
 
     # -- writing ---------------------------------------------------------
     def _flush(self) -> None:
+        # Reset the schedule up front so empty flushes still advance the timer.
+        self._last_flush = time.monotonic()
         items = self._service._drain_buffer()
         if not items:
             return
@@ -312,3 +319,6 @@ class _PersistenceWorker(QThread):
                 logger.debug("%s read failed: %s", method_name, exc)
                 return []
         return []
+
+
+__all__ = ["PersistenceService"]

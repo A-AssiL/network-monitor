@@ -20,7 +20,6 @@ Architecture
   informative placeholder instead of crashing.
 - A time-window selector lets the user cap how much history is shown.
 """
-
 from __future__ import annotations
 
 import logging
@@ -28,6 +27,7 @@ from collections import deque
 from collections.abc import Iterable
 
 from PySide6.QtCore import Qt, Slot
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -56,10 +56,17 @@ _CARD_BG = "#1e1f26"
 _CARD_BORDER = "#2c2e38"
 
 
+def _fill_brush(color: str, alpha: int = 40):
+    """Return a translucent PyQtGraph brush for area fills under a curve."""
+    import pyqtgraph as pg
+
+    qcolor = QColor(color)
+    qcolor.setAlpha(alpha)
+    return pg.mkBrush(qcolor)
+
+
 class GraphsPage(QWidget):
-    """
-    Real-time traffic graphs (combined live, download, and upload history).
-    """
+    """Real-time traffic graphs (combined live, download, and upload history)."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -110,10 +117,16 @@ class GraphsPage(QWidget):
             # Combined live chart (larger, on top).
             live = self._new_plot("Live Bandwidth")
             self._live_download_curve = live.plot(
-                pen=pg.mkPen(_DOWNLOAD_COLOR, width=2), name="Download"
+                pen=pg.mkPen(_DOWNLOAD_COLOR, width=2),
+                name="Download",
+                fillLevel=0,
+                brush=_fill_brush(_DOWNLOAD_COLOR),
             )
             self._live_upload_curve = live.plot(
-                pen=pg.mkPen(_UPLOAD_COLOR, width=2), name="Upload"
+                pen=pg.mkPen(_UPLOAD_COLOR, width=2),
+                name="Upload",
+                fillLevel=0,
+                brush=_fill_brush(_UPLOAD_COLOR),
             )
             root.addWidget(self._wrap_card("Live Bandwidth", live), stretch=2)
 
@@ -122,20 +135,25 @@ class GraphsPage(QWidget):
             history_row.setSpacing(16)
 
             dl = self._new_plot("Download")
-            self._download_curve = dl.plot(pen=pg.mkPen(_DOWNLOAD_COLOR, width=2))
-            dl.getPlotItem().getViewBox().setYRange(0, 1, padding=0)
+            self._download_curve = dl.plot(
+                pen=pg.mkPen(_DOWNLOAD_COLOR, width=2),
+                fillLevel=0,
+                brush=_fill_brush(_DOWNLOAD_COLOR),
+            )
             history_row.addWidget(self._wrap_card("Download History", dl), stretch=1)
 
             ul = self._new_plot("Upload")
-            self._upload_curve = ul.plot(pen=pg.mkPen(_UPLOAD_COLOR, width=2))
+            self._upload_curve = ul.plot(
+                pen=pg.mkPen(_UPLOAD_COLOR, width=2),
+                fillLevel=0,
+                brush=_fill_brush(_UPLOAD_COLOR),
+            )
             history_row.addWidget(self._wrap_card("Upload History", ul), stretch=1)
 
             root.addLayout(history_row, stretch=3)
         except Exception as exc:  # pyqtgraph missing / backend failure
             logger.warning("PyQtGraph unavailable, graphs disabled: %s", exc)
-            placeholder = QLabel(
-                "Traffic graphs unavailable (PyQtGraph not installed)."
-            )
+            placeholder = QLabel("Traffic graphs unavailable (PyQtGraph not installed).")
             placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
             placeholder.setStyleSheet("color: #8b949e;")
             root.addWidget(placeholder, stretch=1)
@@ -169,7 +187,6 @@ class GraphsPage(QWidget):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
-
         caption = QLabel(title)
         caption.setStyleSheet(
             "color: #e6edf3; font-size: 14px; font-weight: 600; border: none;"
@@ -187,8 +204,7 @@ class GraphsPage(QWidget):
     # -- slots (state updates) ------------------------------------------
     @Slot(object)
     def update_bandwidth(self, sample) -> None:
-        """
-        Append a new bandwidth sample and refresh all charts in real time.
+        """Append a new bandwidth sample and refresh all charts in real time.
 
         Parameters
         ----------
@@ -198,7 +214,6 @@ class GraphsPage(QWidget):
         """
         download = float(getattr(sample, "download_mbps", 0.0))
         upload = float(getattr(sample, "upload_mbps", 0.0))
-
         self._times.append(float(self._sample_index))
         self._download.append(download)
         self._upload.append(upload)
@@ -240,3 +255,6 @@ class GraphsPage(QWidget):
             self._download_curve.setData(times, download)
         if self._upload_curve is not None:
             self._upload_curve.setData(times, upload)
+
+
+__all__ = ["GraphsPage"]

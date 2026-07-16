@@ -6,6 +6,7 @@ the background **services** that feed them:
 ​
 - :class:`~app.services.monitor_service.MonitorService` -- live bandwidth samples.
 - :class:`~app.services.scan_service.ScanService`       -- ARP scans + device persistence.
+- :class:`~app.services.capture_service.CaptureService` -- packet capture -> packets_captured.
 - :class:`~app.services.persistence_service.PersistenceService` -- traffic write-through and history read-back.
 ​
 The window is created with an optional ``database`` (opened by ``main.py``). All
@@ -14,7 +15,6 @@ window still runs, it simply skips the corresponding wiring. Signals flow
 strictly one way -- services emit domain objects, the window fans them out to
 the relevant pages, and the pages remain pure views.
 """
-
 from __future__ import annotations
 
 import logging
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QPushButton,
+    QSizePolicy,
     QStackedWidget,
     QStatusBar,
     QToolBar,
@@ -53,24 +54,53 @@ except Exception:  # pragma: no cover
     HistoryPage = None  # type: ignore[assignment]
 
 try:
+    from app.ui.capture_page import CapturePage
+except Exception:  # pragma: no cover
+    CapturePage = None  # type: ignore[assignment]
+
+try:
     from services.monitor_service import MonitorService
 except Exception:  # pragma: no cover
-    MonitorService = None  # type: ignore[assignment]
+    try:
+        from services.monitor_service import MonitorService
+    except Exception:
+        MonitorService = None  # type: ignore[assignment]
 
 try:
     from services.scan_service import ScanService
 except Exception:  # pragma: no cover
-    ScanService = None  # type: ignore[assignment]
+    try:
+        from services.scan_service import ScanService
+    except Exception:
+        ScanService = None  # type: ignore[assignment]
+
+try:
+    from services.capture_service import CaptureService
+except Exception:  # pragma: no cover
+    try:
+        from services.capture_service import CaptureService
+    except Exception:
+        CaptureService = None  # type: ignore[assignment]
 
 try:
     from services.persistence_service import PersistenceService
 except Exception:  # pragma: no cover
-    PersistenceService = None  # type: ignore[assignment]
+    try:
+        from services.persistence_service import PersistenceService
+    except Exception:
+        PersistenceService = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
 # Sidebar navigation entries, in order.
-_NAV_ITEMS: tuple[str, ...] = ("Dashboard", "Devices", "Traffic", "History", "Settings")
+_NAV_ITEMS: tuple[str, ...] = (
+    "Dashboard",
+    "Devices",
+    "Traffic",
+    "Capture",
+    "History",
+    "Settings",
+)
 
 _DARK_QSS = """
 QMainWindow, QWidget { background-color: #16171d; color: #e6edf3; }
@@ -139,7 +169,9 @@ class MainWindow(QMainWindow):
         # Services (created in _start_services once the UI exists).
         self._monitor = None
         self._scan_service = None
+        self._capture_service = None
         self._persistence = None
+        self._packet_count = 0
 
         self.setWindowTitle("Network Monitor Pro")
         self.resize(1180, 720)
@@ -191,7 +223,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(title)
 
         spacer = QWidget()
-        spacer.setSizePolicy(spacer.sizePolicy().horizontalPolicy(), spacer.sizePolicy().verticalPolicy())
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         toolbar.addWidget(spacer)
 
         self._scan_button = QPushButton("Scan Network")
@@ -203,6 +235,11 @@ class MainWindow(QMainWindow):
         self.dashboard_page = DashboardPage()
         self.devices_page = DevicesPage()
         self.graphs_page = GraphsPage()
+
+        if CapturePage is not None:
+            self.capture_page: QWidget = CapturePage()
+        else:
+            self.capture_page = _PlaceholderPage("Capture")
 
         if HistoryPage is not None:
             self.history_page: QWidget = HistoryPage()
@@ -219,6 +256,7 @@ class MainWindow(QMainWindow):
             "Dashboard": self.dashboard_page,
             "Devices": self.devices_page,
             "Traffic": self.graphs_page,
+            "Capture": self.capture_page,
             "History": self.history_page,
             "Settings": self.settings_page,
         }
@@ -231,6 +269,7 @@ class MainWindow(QMainWindow):
         self._start_persistence()
         self._start_scan_service()
         self._start_monitor()
+        self._start_capture()
         self._wire_settings()
         self._wire_history()
 
@@ -312,6 +351,41 @@ class MainWindow(QMainWindow):
             logger.error("Failed to start bandwidth monitor: %s", exc)
             self._monitor = None
 
+    def _start_capture(self) -> None:
+        """Create the packet capture service and wire it to the capture page.
+
+        The page is a pure view: it *requests* start/stop and the service
+        confirms state, so the connection is two-way but the data flow stays
+        one-directional (service -> page for packets/state). Packets arrive in
+        batches (see CaptureService) to keep the GUI responsive.
+        """
+        page = self.capture_page
+        if CaptureService is None:
+            logger.info("Capture service unavailable; packet capture disabled")
+            self._set_capture_available(False)
+            return
+        try:
+            self._capture_service = CaptureService(database=self._database)
+            # service -> page / window
+            self._capture_service.packets_captured.connect(self._on_packets_captured)
+            self._capture_service.capture_started.connect(self._on_capture_started)
+            self._capture_service.capture_stopped.connect(self._on_capture_stopped)
+            self._capture_service.error.connect(self._on_capture_error)
+            # page -> service (only if the real capture page is present)
+            start_sig = getattr(page, "start_requested", None)
+            stop_sig = getattr(page, "stop_requested", None)
+            if start_sig is not None:
+                start_sig.connect(self._capture_service.start)
+            if stop_sig is not None:
+                stop_sig.connect(self._capture_service.stop)
+            available = self._capture_service.is_available()
+            self._set_capture_available(available)
+            logger.info("Capture service ready (available=%s)", available)
+        except Exception as exc:  # pragma: no cover
+            logger.error("Failed to create capture service: %s", exc)
+            self._capture_service = None
+            self._set_capture_available(False)
+
     def _wire_settings(self) -> None:
         """React to live settings changes (interface / interval)."""
         page = self.settings_page
@@ -357,6 +431,15 @@ class MainWindow(QMainWindow):
             self._scan_service.start_scan()
         elif hasattr(self.devices_page, "start_scan"):
             self.devices_page.start_scan()
+
+    def _set_capture_available(self, available: bool) -> None:
+        """Tell the capture page whether the backend is usable."""
+        setter = getattr(self.capture_page, "set_available", None)
+        if callable(setter):
+            try:
+                setter(available)
+            except Exception:  # pragma: no cover
+                pass
 
     # -- navigation ------------------------------------------------------
     @Slot(int)
@@ -429,6 +512,68 @@ class MainWindow(QMainWindow):
         if callable(update):
             update(connected, discovered)
 
+    # -- packet capture --------------------------------------------------
+    @Slot(object)
+    def _on_packets_captured(self, packets: object) -> None:
+        """Forward a *batch* of captured packets to the page and dashboard.
+
+        Prefers the page's batch API (``add_packets``); falls back to calling
+        ``add_packet`` per item so this works even before the capture page is
+        upgraded. Either way the GUI is touched at most a few times a second.
+        """
+        try:
+            count = len(packets)  # type: ignore[arg-type]
+        except TypeError:
+            # Defensive: tolerate a single packet if something emits one.
+            packets = [packets]
+            count = 1
+        if not count:
+            return
+
+        add_many = getattr(self.capture_page, "add_packets", None)
+        if callable(add_many):
+            add_many(packets)
+        else:
+            add_one = getattr(self.capture_page, "add_packet", None)
+            if callable(add_one):
+                for packet in packets:
+                    add_one(packet)
+
+        self._packet_count += count
+        update = getattr(self.dashboard_page, "update_capture_stats", None)
+        if callable(update):
+            update(self._packet_count)
+
+    @Slot()
+    def _on_capture_started(self) -> None:
+        self._set_capturing(True)
+
+    @Slot()
+    def _on_capture_stopped(self) -> None:
+        self._set_capturing(False)
+
+    def _set_capturing(self, capturing: bool) -> None:
+        setter = getattr(self.capture_page, "set_capturing", None)
+        if callable(setter):
+            try:
+                setter(capturing)
+            except Exception:  # pragma: no cover
+                pass
+        self.statusBar().showMessage(
+            "Packet capture running\u2026" if capturing else "Packet capture stopped"
+        )
+
+    @Slot(str)
+    def _on_capture_error(self, message: str) -> None:
+        shower = getattr(self.capture_page, "show_error", None)
+        if callable(shower):
+            try:
+                shower(message)
+            except Exception:  # pragma: no cover
+                pass
+        self.statusBar().showMessage(f"Capture error: {message}")
+        logger.warning("Capture error: %s", message)
+
     # -- persistence callbacks ------------------------------------------
     @Slot(object)
     def _on_traffic_loaded(self, rows: object) -> None:
@@ -483,7 +628,12 @@ class MainWindow(QMainWindow):
     # -- lifecycle -------------------------------------------------------
     def closeEvent(self, event: Any) -> None:
         """Stop all background services cleanly before the window closes."""
-        for service in (self._monitor, self._scan_service, self._persistence):
+        for service in (
+            self._monitor,
+            self._scan_service,
+            self._capture_service,
+            self._persistence,
+        ):
             stop = getattr(service, "stop", None)
             if callable(stop):
                 try:
@@ -491,3 +641,6 @@ class MainWindow(QMainWindow):
                 except Exception as exc:  # pragma: no cover
                     logger.debug("Error stopping %s: %s", service, exc)
         super().closeEvent(event)
+
+
+__all__ = ["MainWindow"]

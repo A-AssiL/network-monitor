@@ -3,25 +3,31 @@
 The landing view of Network Monitor Pro. It surfaces the most important
 real-time metrics at a glance:
 ​
-- Current **download** speed (Mbps)
-- Current **upload** speed (Mbps)
+- Current **download** speed (Mbps) -- with running peak
+- Current **upload** speed (Mbps) -- with running peak
 - Number of **connected** devices (online right now)
 - Total **discovered** devices (seen at any point)
+- **Active alerts** (fed by the alerts service, when wired)
+- **Packets captured** (fed by the capture service, when wired)
 - A **live bandwidth graph** plotting download/upload history
 ​
 Architecture
 ------------
 - This is a pure *view*: it renders state pushed to it via slots and never
   performs network I/O or database access itself. Background workers (the
-  bandwidth monitor / scanner) emit signals that are connected to
-  :meth:`DashboardPage.update_bandwidth` and
-  :meth:`DashboardPage.update_device_counts`.
+  bandwidth monitor / scanner / capture / alert services) emit signals that are
+  connected to the ``update_*`` slots below.
 - The live graph keeps a fixed-length rolling history so memory stays bounded
   regardless of how long the app runs.
 - PyQtGraph is imported lazily/defensively so the rest of the UI still loads
   if the optional plotting dependency is missing.
+​
+Wiring note
+-----------
+``update_alerts`` and ``update_capture_stats`` are new slots for the Alerts and
+Packet Capture features. They are harmless no-ops until connected in
+``main_window.py`` (e.g. ``capture_service.stats_ready.connect(page.update_capture_stats)``).
 """
-
 from __future__ import annotations
 
 import logging
@@ -29,10 +35,10 @@ from collections import deque
 from collections.abc import Iterable
 
 from PySide6.QtCore import Qt, Slot
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
-    QHBoxLayout,
     QLabel,
     QSizePolicy,
     QVBoxLayout,
@@ -51,11 +57,13 @@ _CARD_BG = "#1e1f26"
 _CARD_BORDER = "#2c2e38"
 _ACCENT_DEVICES = "#3fb950"
 _ACCENT_DISCOVERED = "#d29922"
+_ACCENT_ALERTS = "#f85149"
+_ACCENT_PACKETS = "#a371f7"
+_ACCENT_MUTED = "#8b949e"
 
 
 class MetricCard(QFrame):
-    """
-    A compact card showing a single labelled metric.
+    """A compact card showing a single labelled metric.
 
     Parameters
     ----------
@@ -65,6 +73,9 @@ class MetricCard(QFrame):
         Optional unit suffix rendered after the value (e.g. ``"Mbps"``).
     accent:
         Hex colour used for the value text.
+
+    Public API (matches the reusable-widget spec): ``set_value``,
+    ``set_title``, ``set_accent``, ``set_subtitle`` and ``reset``.
     """
 
     def __init__(
@@ -76,6 +87,7 @@ class MetricCard(QFrame):
     ) -> None:
         super().__init__(parent)
         self._unit = unit
+        self._accent = accent
         self.setObjectName("metricCard")
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -101,11 +113,18 @@ class MetricCard(QFrame):
             f"color: {accent}; font-size: 30px; font-weight: 700; border: none;"
         )
 
+        self._subtitle_label = QLabel("")
+        self._subtitle_label.setStyleSheet(
+            f"color: {_ACCENT_MUTED}; font-size: 11px; border: none;"
+        )
+        self._subtitle_label.setVisible(False)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 14, 18, 14)
-        layout.setSpacing(6)
+        layout.setSpacing(4)
         layout.addWidget(self._title_label)
         layout.addWidget(self._value_label)
+        layout.addWidget(self._subtitle_label)
         layout.addStretch(1)
 
     def set_value(self, value: str | float | int) -> None:
@@ -118,13 +137,34 @@ class MetricCard(QFrame):
             text = f"{text} {self._unit}"
         self._value_label.setText(text)
 
+    def set_subtitle(self, text: str) -> None:
+        """Set (or clear) the small muted line under the value."""
+        self._subtitle_label.setText(text)
+        self._subtitle_label.setVisible(bool(text))
+
+    def set_title(self, title: str) -> None:
+        """Update the card's caption."""
+        self._title_label.setText(title.upper())
+
+    def set_accent(self, accent: str) -> None:
+        """Change the value text colour."""
+        self._accent = accent
+        self._value_label.setStyleSheet(
+            f"color: {accent}; font-size: 30px; font-weight: 700; border: none;"
+        )
+
+    def reset(self) -> None:
+        """Reset the card back to its empty state."""
+        self._value_label.setText("--")
+        self.set_subtitle("")
+
 
 class DashboardPage(QWidget):
-    """
-    Real-time overview page.
+    """Real-time overview page.
 
-    Consumes :class:`~app.network.monitor.BandwidthSample` updates and device
-    counts, displaying them as metric cards plus a live download/upload graph.
+    Consumes :class:`~app.network.monitor.BandwidthSample` updates, device
+    counts, alert counts and capture stats, displaying them as metric cards
+    plus a live download/upload graph.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -137,10 +177,16 @@ class DashboardPage(QWidget):
         self._upload: deque[float] = deque(maxlen=HISTORY_LENGTH)
         self._sample_index: int = 0
 
+        # Running peaks (computed from samples; no external wiring needed).
+        self._peak_download: float = 0.0
+        self._peak_upload: float = 0.0
+
         self._download_card = MetricCard("Download", "Mbps", _DOWNLOAD_COLOR)
         self._upload_card = MetricCard("Upload", "Mbps", _UPLOAD_COLOR)
         self._connected_card = MetricCard("Connected Devices", "", _ACCENT_DEVICES)
         self._discovered_card = MetricCard("Total Discovered", "", _ACCENT_DISCOVERED)
+        self._alerts_card = MetricCard("Active Alerts", "", _ACCENT_ALERTS)
+        self._packets_card = MetricCard("Packets Captured", "", _ACCENT_PACKETS)
 
         self._plot_widget: QWidget | None = None
         self._download_curve = None
@@ -156,25 +202,24 @@ class DashboardPage(QWidget):
         root.setSpacing(20)
 
         heading = QLabel("Dashboard")
-        heading.setStyleSheet(
-            "font-size: 22px; font-weight: 700; color: #e6edf3;"
-        )
+        heading.setStyleSheet("font-size: 22px; font-weight: 700; color: #e6edf3;")
         root.addWidget(heading)
 
-        # Metric cards laid out in a responsive 2x2 / 1x4 grid.
+        # Metric cards laid out in a 3x2 grid.
         cards = QGridLayout()
         cards.setSpacing(16)
         cards.addWidget(self._download_card, 0, 0)
         cards.addWidget(self._upload_card, 0, 1)
         cards.addWidget(self._connected_card, 0, 2)
-        cards.addWidget(self._discovered_card, 0, 3)
+        cards.addWidget(self._discovered_card, 1, 0)
+        cards.addWidget(self._alerts_card, 1, 1)
+        cards.addWidget(self._packets_card, 1, 2)
         root.addLayout(cards)
 
         root.addWidget(self._build_graph(), stretch=1)
 
     def _build_graph(self) -> QWidget:
-        """
-        Build the live bandwidth graph, degrading gracefully if PyQtGraph is
+        """Build the live bandwidth graph, degrading gracefully if PyQtGraph is
         unavailable.
         """
         container = QFrame()
@@ -211,19 +256,28 @@ class DashboardPage(QWidget):
             plot.setMenuEnabled(False)
             plot.setMouseEnabled(x=False, y=True)
 
+            dl_fill = QColor(_DOWNLOAD_COLOR)
+            dl_fill.setAlpha(40)
+            ul_fill = QColor(_UPLOAD_COLOR)
+            ul_fill.setAlpha(40)
+
             self._download_curve = plot.plot(
-                pen=pg.mkPen(_DOWNLOAD_COLOR, width=2), name="Download"
+                pen=pg.mkPen(_DOWNLOAD_COLOR, width=2),
+                name="Download",
+                fillLevel=0,
+                brush=pg.mkBrush(dl_fill),
             )
             self._upload_curve = plot.plot(
-                pen=pg.mkPen(_UPLOAD_COLOR, width=2), name="Upload"
+                pen=pg.mkPen(_UPLOAD_COLOR, width=2),
+                name="Upload",
+                fillLevel=0,
+                brush=pg.mkBrush(ul_fill),
             )
             self._plot_widget = plot
             layout.addWidget(plot)
         except Exception as exc:  # pyqtgraph missing / backend failure
             logger.warning("PyQtGraph unavailable, graph disabled: %s", exc)
-            placeholder = QLabel(
-                "Live graph unavailable (PyQtGraph not installed)."
-            )
+            placeholder = QLabel("Live graph unavailable (PyQtGraph not installed).")
             placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
             placeholder.setStyleSheet("color: #8b949e; border: none;")
             layout.addWidget(placeholder)
@@ -233,8 +287,7 @@ class DashboardPage(QWidget):
     # -- slots (state updates) ------------------------------------------
     @Slot(object)
     def update_bandwidth(self, sample) -> None:
-        """
-        Update the speed cards and live graph from a bandwidth sample.
+        """Update the speed cards and live graph from a bandwidth sample.
 
         Parameters
         ----------
@@ -248,6 +301,14 @@ class DashboardPage(QWidget):
         self._download_card.set_value(download)
         self._upload_card.set_value(upload)
 
+        # Track and display running peaks.
+        if download > self._peak_download:
+            self._peak_download = download
+        if upload > self._peak_upload:
+            self._peak_upload = upload
+        self._download_card.set_subtitle(f"peak {self._peak_download:.2f} Mbps")
+        self._upload_card.set_subtitle(f"peak {self._peak_upload:.2f} Mbps")
+
         self._times.append(float(self._sample_index))
         self._download.append(download)
         self._upload.append(upload)
@@ -260,25 +321,67 @@ class DashboardPage(QWidget):
         self._connected_card.set_value(connected)
         self._discovered_card.set_value(discovered)
 
-    def load_history(self, samples: Iterable) -> None:
+    @Slot(int)
+    def update_alerts(self, active: int) -> None:
+        """Update the active-alerts card (Alerts feature).
+
+        Turns muted when there are no active alerts, red when there are.
         """
-        Pre-populate the graph from persisted traffic history (e.g. on start).
+        active = int(active)
+        self._alerts_card.set_value(active)
+        if active > 0:
+            self._alerts_card.set_accent(_ACCENT_ALERTS)
+            self._alerts_card.set_subtitle("needs attention")
+        else:
+            self._alerts_card.set_accent(_ACCENT_DEVICES)
+            self._alerts_card.set_subtitle("all clear")
+
+    @Slot(int, float)
+    def update_capture_stats(self, total_packets: int, rate_pps: float = 0.0) -> None:
+        """Update the packets-captured card (Packet Capture feature).
+
+        Parameters
+        ----------
+        total_packets:
+            Total packets captured in the current session.
+        rate_pps:
+            Optional current capture rate (packets/second) shown as a subtitle.
+        """
+        self._packets_card.set_value(int(total_packets))
+        if rate_pps:
+            self._packets_card.set_subtitle(f"{rate_pps:.0f}/s")
+        else:
+            self._packets_card.set_subtitle("")
+
+    def load_history(self, samples: Iterable) -> None:
+        """Pre-populate the graph from persisted traffic history (e.g. on start).
 
         Parameters
         ----------
         samples:
-            Iterable of objects exposing ``download_mbps`` and
-            ``upload_mbps`` attributes, oldest first.
+            Iterable of objects exposing ``download_mbps`` and ``upload_mbps``
+            attributes, oldest first.
         """
         self._times.clear()
         self._download.clear()
         self._upload.clear()
         self._sample_index = 0
+        self._peak_download = 0.0
+        self._peak_upload = 0.0
+
         for sample in samples:
+            download = float(getattr(sample, "download_mbps", 0.0))
+            upload = float(getattr(sample, "upload_mbps", 0.0))
             self._times.append(float(self._sample_index))
-            self._download.append(float(getattr(sample, "download_mbps", 0.0)))
-            self._upload.append(float(getattr(sample, "upload_mbps", 0.0)))
+            self._download.append(download)
+            self._upload.append(upload)
+            self._peak_download = max(self._peak_download, download)
+            self._peak_upload = max(self._peak_upload, upload)
             self._sample_index += 1
+
+        if self._download:
+            self._download_card.set_subtitle(f"peak {self._peak_download:.2f} Mbps")
+            self._upload_card.set_subtitle(f"peak {self._peak_upload:.2f} Mbps")
         self._redraw_graph()
 
     # -- internals -------------------------------------------------------
@@ -289,3 +392,6 @@ class DashboardPage(QWidget):
         times = list(self._times)
         self._download_curve.setData(times, list(self._download))
         self._upload_curve.setData(times, list(self._upload))
+
+
+__all__ = ["DashboardPage", "MetricCard"]

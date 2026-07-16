@@ -20,9 +20,9 @@ Design
 - Interval and interface can be changed live from the GUI thread; the change is
   queued and applied safely on the worker thread.
 """
-
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 
@@ -41,8 +41,7 @@ _UNSET = object()
 
 
 class MonitorService(QThread):
-    """
-    Background bandwidth sampler.
+    """Background bandwidth sampler.
 
     Parameters
     ----------
@@ -69,6 +68,7 @@ class MonitorService(QThread):
         self._interface_pending = _UNSET  # queued interface change
         self._monitor = None
         self._sample_method = None
+        self._sample_takes_arg: bool | None = None  # cached method arity
         self._error_emitted = False
 
     # -- public API (call from any thread) -------------------------------
@@ -103,7 +103,6 @@ class MonitorService(QThread):
 
         while not self._stop.is_set():
             interval = self._apply_pending_and_get_interval()
-
             try:
                 sample = self._read_sample()
             except Exception as exc:  # a bad read must not kill the thread
@@ -135,8 +134,7 @@ class MonitorService(QThread):
             self.error.emit(f"Could not start bandwidth monitor: {exc}")
             return False
 
-        self._sample_method = self._resolve_sample_method(self._monitor)
-        if self._sample_method is None:
+        if not self._bind_sample_method(self._monitor):
             msg = "BandwidthMonitor exposes no recognised sampling method"
             logger.error(msg)
             self.error.emit(msg)
@@ -158,25 +156,72 @@ class MonitorService(QThread):
                     logger.debug("Could not set interface on monitor: %s", exc)
             return monitor
 
-    @staticmethod
-    def _resolve_sample_method(monitor):
-        """Find the first supported single-sample method on *monitor*."""
+    def _bind_sample_method(self, monitor) -> bool:
+        """Resolve the sampling method and cache whether it needs an argument.
+
+        Returns ``True`` if a usable method was found. Arity is detected once
+        here (rather than per-read) so we never accidentally call the sampler
+        twice, which would corrupt delta-based bandwidth math.
+        """
         for name in _SAMPLE_METHOD_NAMES:
             method = getattr(monitor, name, None)
             if callable(method):
-                return method
-        return None
+                self._sample_method = method
+                self._sample_takes_arg = self._detect_takes_arg(method)
+                logger.info(
+                    "Using BandwidthMonitor.%s() (takes_arg=%s)",
+                    name,
+                    self._sample_takes_arg,
+                )
+                return True
+        self._sample_method = None
+        self._sample_takes_arg = None
+        return False
+
+    @staticmethod
+    def _detect_takes_arg(method) -> bool | None:
+        """Return True/False if the method requires a positional arg, else None."""
+        try:
+            sig = inspect.signature(method)
+        except (TypeError, ValueError):
+            return None  # unknown; caller falls back to try/except
+        for param in sig.parameters.values():
+            if (
+                param.kind
+                in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+                and param.default is inspect.Parameter.empty
+            ):
+                return True
+        return False
 
     def _read_sample(self):
-        """Read one sample, tolerating a no-arg or interval-arg signature."""
+        """Read one sample, respecting the sampler's detected arity."""
         method = self._sample_method
-        try:
-            return method()
-        except TypeError:
-            # Some implementations take the measurement window as an argument.
+        if method is None:
+            return None
+
+        takes_arg = self._sample_takes_arg
+        if takes_arg is True:
             with self._lock:
                 interval = self._interval
             return method(interval)
+        if takes_arg is False:
+            return method()
+
+        # Arity unknown: try no-arg, then fall back to interval-arg once.
+        try:
+            sample = method()
+            self._sample_takes_arg = False  # cache success for next time
+            return sample
+        except TypeError:
+            with self._lock:
+                interval = self._interval
+            sample = method(interval)
+            self._sample_takes_arg = True
+            return sample
 
     def _apply_pending_and_get_interval(self) -> float:
         """Apply any queued interface change and return the current interval."""
@@ -186,7 +231,6 @@ class MonitorService(QThread):
             self._interface_pending = _UNSET
             if pending is not _UNSET:
                 self._interface = pending
-
         if pending is not _UNSET:
             self._change_interface(pending)
         return interval
@@ -204,12 +248,13 @@ class MonitorService(QThread):
                 return
             except Exception as exc:
                 logger.debug("set_interface failed, recreating monitor: %s", exc)
+
         # Fall back to recreating the monitor with the new interface.
         try:
             from app.network.monitor import BandwidthMonitor
 
             self._monitor = self._construct(BandwidthMonitor, interface)
-            self._sample_method = self._resolve_sample_method(self._monitor)
+            self._bind_sample_method(self._monitor)
             logger.info("Monitor recreated for interface %s", interface or "all")
         except Exception as exc:
             logger.exception("Could not switch monitor interface")
@@ -237,3 +282,6 @@ class MonitorService(QThread):
             return max(_MIN_INTERVAL, float(interval))
         except (TypeError, ValueError):
             return 1.0
+
+
+__all__ = ["MonitorService"]
