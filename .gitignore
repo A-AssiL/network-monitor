@@ -4,5 +4,7 @@ network_monitor.db
 __pycache__/
 
 
+llm/
+
 
 MYNotes.txt
