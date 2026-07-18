@@ -8,3 +8,7 @@ llm/
 
 
 MYNotes.txt
+
+
+network_monitor.db-wal
+network_monitor.db-shm
